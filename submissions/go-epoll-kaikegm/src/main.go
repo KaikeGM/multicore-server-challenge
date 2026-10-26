@@ -183,8 +183,8 @@ func logStartup(cfg config, addr string) {
 	log.Printf("conduit transport=epoll listening=%s cores=%d loops=%d connections=%d", addr, cfg.cores, cfg.http.loops, cfg.sockets)
 	log.Printf("database read_conns=%d write_conns=%d pipeline_depth=%d read_queue=%d write_queue=%d read_batch=%d write_batch=%d",
 		db.readConns, db.writeConns, db.pipelineDepth, db.readQueue, db.writeQueue, db.readBatch, db.writeBatch)
-	log.Printf("database write_linger=%s write_flush=%s bcrypt_workers=%d bcrypt_wait=%s",
-		db.writeLinger, db.writeFlush, db.bcryptWorkers, db.bcryptWait)
+	log.Printf("database read_linger=%s write_linger=%s write_flush=%s bcrypt_workers=%d bcrypt_wait=%s",
+		db.readLinger, db.writeLinger, db.writeFlush, db.bcryptWorkers, db.bcryptWait)
 }
 
 func envOr(name, fallback string) string {

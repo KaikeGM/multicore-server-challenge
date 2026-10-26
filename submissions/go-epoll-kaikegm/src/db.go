@@ -58,6 +58,7 @@ type dbConfig struct {
 	readBatch, writeBatch      int           // most requests per batch
 	readRouteSlack             int           // load slack for family-affinity read routing
 	readQueue, writeQueue      int           // queue sizes: every request slot fits
+	readLinger                 time.Duration // how long a read batch waits for company when pipeline is empty
 	writeLinger, writeFlush    time.Duration // how long a write batch waits for company
 	queueTimeout, execTimeout  time.Duration // 503 after this long queued; socket deadline
 	bcryptWorkers              int           // bcrypt compute goroutines
@@ -99,6 +100,7 @@ func dbConfigFromEnv(cores, slots int) (dbConfig, error) {
 		dst  *time.Duration
 		def  time.Duration
 	}{
+		{"READ_LINGER", &c.readLinger, 2 * time.Millisecond},
 		{"WRITE_LINGER", &c.writeLinger, time.Millisecond},
 		{"WRITE_FLUSH_INTERVAL", &c.writeFlush, 200 * time.Millisecond},
 		{"QUEUE_TIMEOUT", &c.queueTimeout, 30 * time.Second},
@@ -475,10 +477,16 @@ func (w *worker) next(q chan *reactorJob, block bool) ([]*reactorJob, bool) {
 }
 
 // collect drains already-queued requests into the batch. With nothing in
-// flight (linger), a write batch also waits up to WRITE_LINGER for more writes,
+// flight (linger), a batch waits up to WRITE_LINGER / READ_LINGER for more requests,
 // but never past WRITE_FLUSH_INTERVAL after its first request was queued.
 func (w *worker) collect(q chan *reactorJob, jobs []*reactorJob, linger bool) []*reactorJob {
 	limit := cap(jobs)
+	perWait := w.d.cfg.writeLinger
+	totalWait := w.d.cfg.writeFlush
+	if !w.write {
+		perWait = w.d.cfg.readLinger
+		totalWait = w.d.cfg.readLinger
+	}
 	for len(jobs) < limit {
 		select {
 		case j, ok := <-q:
@@ -490,11 +498,11 @@ func (w *worker) collect(q chan *reactorJob, jobs []*reactorJob, linger bool) []
 			continue
 		default:
 		}
-		if !linger || !w.write || w.d.cfg.writeLinger == 0 {
+		if !linger || perWait == 0 {
 			return jobs
 		}
-		wait := w.d.cfg.writeLinger
-		if left := time.Duration(jobs[0].enqueued + int64(w.d.cfg.writeFlush) - monoNow()); left < wait {
+		wait := perWait
+		if left := time.Duration(jobs[0].enqueued + int64(totalWait) - monoNow()); left < wait {
 			wait = left
 		}
 		if wait <= 0 {

@@ -28,11 +28,11 @@ const (
   JOIN users u ON u.id = a.author_id`
 
 	listAll        = articleListSelect + ` WHERE a.id IN (SELECT * FROM (SELECT p.id FROM articles p ORDER BY p.id DESC LIMIT $2 OFFSET $3) page LIMIT 100) ORDER BY a.id DESC`
-	countAll       = `SELECT CASE WHEN EXISTS (SELECT 1 FROM articles a ORDER BY a.id OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM articles a) END AS count`
+	countAll       = `SELECT CASE WHEN EXISTS (SELECT 1 FROM articles a OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s) END AS count`
 	listByTag      = articleListSelect + ` WHERE a.id IN (SELECT * FROM (SELECT at.article_id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4) ORDER BY at.article_id DESC LIMIT $2 OFFSET $3) page LIMIT 100) ORDER BY a.id DESC`
-	countByTag     = `SELECT count(*) AS count FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $1) LIMIT 1000) s`
+	countByTag     = `SELECT CASE WHEN EXISTS (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $1) OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $1) LIMIT 1000) s) END AS count`
 	listByAuthor   = articleListSelect + ` WHERE a.id IN (SELECT * FROM (SELECT p.id FROM articles p WHERE p.author_id = (SELECT au.id FROM users au WHERE au.username = $4) ORDER BY p.id DESC LIMIT $2 OFFSET $3) page LIMIT 100) ORDER BY a.id DESC`
-	countByAuthor  = `SELECT count(*) AS count FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $1) LIMIT 1000) s`
+	countByAuthor  = `SELECT CASE WHEN EXISTS (SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $1) OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $1) LIMIT 1000) s) END AS count`
 	listByFavorite = `SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
        ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
               FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
@@ -43,9 +43,9 @@ const (
   FROM articles a
   JOIN users u ON u.id = a.author_id
   WHERE a.id IN (SELECT * FROM (SELECT f.article_id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) ORDER BY f.article_id DESC LIMIT $2 OFFSET $3) page LIMIT 100) ORDER BY a.id DESC`
-	countByFavorite = `SELECT count(*) AS count FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $1) LIMIT 1000) s`
+	countByFavorite = `SELECT CASE WHEN EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $1) OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $1) LIMIT 1000) s) END AS count`
 	listFeed        = articleListSelect + ` WHERE a.id IN (SELECT * FROM (SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (LEAST($2::bigint::numeric + $3::bigint::numeric, 9223372036854775807)::bigint)) x WHERE fo.follower_id = $1 ORDER BY x.id DESC LIMIT $2 OFFSET $3) page LIMIT 100) ORDER BY a.id DESC`
-	countFeed       = `SELECT count(*) AS count FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1)) ORDER BY a.author_id, a.id DESC LIMIT 1000) s`
+	countFeed       = `SELECT CASE WHEN EXISTS (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) LIMIT 1000) s) END AS count`
 
 	articleBySlug = articleFullSelect + ` WHERE a.slug = $2`
 	articleByID   = articleFullSelect + ` WHERE a.id = $2`
