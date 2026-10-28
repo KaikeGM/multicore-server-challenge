@@ -369,6 +369,11 @@ func listenSocket(host string, port int, reuse bool) (int, int, error) {
 			return fail(err)
 		}
 	}
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_KEEPALIVE, 1)
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPIDLE, 60)
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, 30)
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPCNT, 3)
 	if err = unix.Bind(fd, sa); err != nil {
 		return fail(err)
 	}
@@ -646,11 +651,6 @@ func (r *eventLoop) accept() {
 			r.server.sockets.Add(-1)
 			continue
 		}
-		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_KEEPALIVE, 1)
-		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPIDLE, 60)
-		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, 30)
-		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPCNT, 3)
 		c := &r.conns[fd]
 		generation := c.generation + 1
 		*c = reactorConn{

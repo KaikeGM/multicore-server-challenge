@@ -2,11 +2,11 @@
 
 **Front: direct**
 
-A Conduit server in pure Go (`CGO_ENABLED=0`, PGO-enabled) built on a custom multi-loop `epoll` reactor, zero-allocation request/response path, and PostgreSQL query coalescing. Source is in `src/`.
+A Conduit server in pure Go (`CGO_ENABLED=0`) built on a custom multi-loop `epoll` reactor, zero-allocation request/response path, and PostgreSQL query coalescing. Source is in `src/`.
 
 | Piece | Version |
 |---|---|
-| Go | 1.27 (`-pgo=auto`) |
+| Go | 1.27 (`-trimpath -ldflags="-s -w"`) |
 | HTTP | Custom epoll reactor (`SO_REUSEPORT`, `TCP_DEFER_ACCEPT`, `EPOLLONESHOT`) and zero-copy HTTP/1.1 parser |
 | Postgres driver | `github.com/jackc/pgx/v5` v5.11.0 (`pgconn` extended binary protocol + pipeline mode) |
 | JSON | Custom binary-row encoder (8-byte unrolled string escaper) + zero-alloc flat JSON body scanner with `encoding/json` fallback |
