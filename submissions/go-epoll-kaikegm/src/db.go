@@ -100,7 +100,7 @@ func dbConfigFromEnv(cores, slots int) (dbConfig, error) {
 		dst  *time.Duration
 		def  time.Duration
 	}{
-		{"READ_LINGER", &c.readLinger, 2 * time.Millisecond},
+		{"READ_LINGER", &c.readLinger, 200 * time.Microsecond},
 		{"WRITE_LINGER", &c.writeLinger, time.Millisecond},
 		{"WRITE_FLUSH_INTERVAL", &c.writeFlush, 200 * time.Millisecond},
 		{"QUEUE_TIMEOUT", &c.queueTimeout, 30 * time.Second},
