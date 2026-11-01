@@ -157,6 +157,7 @@ type worker struct {
 
 	load     atomic.Int64                    // queued + in-flight requests on this read worker
 	families [numReadFamilies]atomic.Int64   // queued requests per read family on this read worker
+	ewmaLen  int                             // EWMA of recent read batch sizes (zero-syscall governor)
 
 	jobs     []*reactorJob // the batch being collected (reused)
 	pending  []*reactorJob // the part of it that needs a statement (reused)
@@ -215,6 +216,7 @@ func newDBDispatcher(s *reactorServer, cfg dbConfig, pgcfg *pgconn.Config, secre
 			w.q = make(chan *reactorJob, cfg.readQueue)
 			w.batchBuf = make([]byte, 0, 8192)
 			w.replies = make([]reply, limit)
+			w.ewmaLen = max(4, limit/4)
 		}
 		w.jobs = make([]*reactorJob, 0, limit)
 		w.pending = make([]*reactorJob, 0, limit)
@@ -422,7 +424,7 @@ func (w *worker) loop(q chan *reactorJob) {
 			if !open {
 				break
 			}
-			if !w.write && w.n > 0 && len(q) < w.d.cfg.readBatch {
+			if !w.write && w.n > 0 && len(q) < max(8, w.ewmaLen) {
 				break
 			}
 			jobs, ok := w.next(q, w.n == 0)
@@ -432,6 +434,9 @@ func (w *worker) loop(q chan *reactorJob) {
 			}
 			if len(jobs) == 0 {
 				break
+			}
+			if !w.write {
+				w.ewmaLen = (w.ewmaLen*7 + len(jobs)) >> 3
 			}
 			if pending := w.plan(jobs); len(pending) > 0 {
 				w.send(pending, false)
@@ -478,14 +483,16 @@ func (w *worker) next(q chan *reactorJob, block bool) ([]*reactorJob, bool) {
 
 // collect drains already-queued requests into the batch. With nothing in
 // flight (linger), a batch waits up to WRITE_LINGER / READ_LINGER for more requests,
-// but never past WRITE_FLUSH_INTERVAL after its first request was queued.
+// releasing early for reads once the EWMA target batch size is reached.
 func (w *worker) collect(q chan *reactorJob, jobs []*reactorJob, linger bool) []*reactorJob {
 	limit := cap(jobs)
 	perWait := w.d.cfg.writeLinger
 	totalWait := w.d.cfg.writeFlush
+	target := limit
 	if !w.write {
 		perWait = w.d.cfg.readLinger
 		totalWait = w.d.cfg.readLinger
+		target = min(limit, max(4, w.ewmaLen+(w.ewmaLen>>2)))
 	}
 	for len(jobs) < limit {
 		select {
@@ -498,7 +505,7 @@ func (w *worker) collect(q chan *reactorJob, jobs []*reactorJob, linger bool) []
 			continue
 		default:
 		}
-		if !linger || perWait == 0 {
+		if !linger || perWait == 0 || (!w.write && len(jobs) >= target) {
 			return jobs
 		}
 		wait := perWait
@@ -592,7 +599,21 @@ func (w *worker) sendSingleStmt(j *reactorJob) {
 	w.pipe.SendQueryStatement(w.sd[d.stmt], d.params[:d.nparams], formats, resultBinary)
 }
 
-func shouldShare(group []*reactorJob) bool {
+func shouldShare(stmt stmtID, group []*reactorJob) bool {
+	if stmt == stArticleBySlug || stmt == stComments {
+		// Only use CTE shared enrichment when at least 2 requests in the batch ask for the same slug
+		for i := 0; i < len(group); i++ {
+			for k := i + 1; k < len(group); k++ {
+				if samePageKey(&group[i].db, &group[k].db) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if stmt == stListFeed {
+		return len(group) >= 8
+	}
 	if len(group) >= 4 {
 		return true
 	}
@@ -638,7 +659,7 @@ func (w *worker) sendReadGroup(f *flight, stmt stmtID, start, end int) {
 		}
 		return
 	}
-	if shareStmt, canShare := shareStmtFor(stmt); canShare && shouldShare(group) {
+	if shareStmt, canShare := shareStmtFor(stmt); canShare && shouldShare(stmt, group) {
 		targetStmt = shareStmt
 	}
 	f.groups = append(f.groups, flightGroup{mode: groupCoalesced, start: start, end: end})

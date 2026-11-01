@@ -30,8 +30,10 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -40,8 +42,18 @@ func main() {
 	}
 }
 
+func applySchedBatch() {
+	if envOr("SCHED_BATCH", "0") != "1" {
+		return
+	}
+	const schedBatch = 3 // Linux SCHED_BATCH
+	var param [4]byte    // struct sched_param { int sched_priority; } = 0
+	_, _, _ = unix.Syscall(unix.SYS_SCHED_SETSCHEDULER, 0, uintptr(schedBatch), uintptr(unsafe.Pointer(&param[0])))
+}
+
 // run starts everything and blocks until SIGTERM (or a fatal error).
 func run() error {
+	applySchedBatch()
 	if profPath := os.Getenv("CPU_PROFILE"); profPath != "" {
 		f, err := os.Create(profPath)
 		if err != nil {
@@ -125,6 +137,11 @@ func loadConfig() (config, error) {
 	var fdLimit syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &fdLimit); err != nil {
 		return cfg, err
+	}
+	if fdLimit.Cur < fdLimit.Max {
+		fdLimit.Cur = fdLimit.Max
+		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &fdLimit)
+		_ = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &fdLimit)
 	}
 	reserve := uint64(cfg.db.readConns + cfg.db.writeConns + 256)
 	if fdLimit.Cur <= reserve+16 {

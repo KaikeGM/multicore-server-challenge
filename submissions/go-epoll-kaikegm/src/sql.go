@@ -91,11 +91,14 @@ const (
 	stBatchArticleBySlug
 	stBatchComments
 
-	// Shared-enrichment list statements (deduplicated count, page, and article enrichment).
+	// Shared-enrichment read statements (deduplicated count, page, and article/comment enrichment).
 	stShareListAll
 	stShareListTag
 	stShareListAuthor
 	stShareListFavorite
+	stShareListFeed
+	stShareArticleBySlug
+	stShareComments
 
 	// Write statements.
 	stRegister
@@ -249,6 +252,124 @@ func makeShareListFiltered(resolveSQL, countSQL, pageSQL string) stmtDef {
 	return stmtDef{sql: sql, params: "IIIa"}
 }
 
+func makeShareListFeed() stmtDef {
+	sql := `WITH requests AS MATERIALIZED (
+  SELECT r.p1, r.p2, r.p3, r.ord,
+         CASE WHEN r.p1 = 0 THEN ARRAY[]::bigint[] ELSE ARRAY(SELECT vf.article_id FROM favorites vf WHERE vf.user_id = r.p1) END AS favs
+  FROM unnest($1::bigint[], $2::bigint[], $3::bigint[]) WITH ORDINALITY AS r(p1, p2, p3, ord)),
+ distinct_viewers AS MATERIALIZED (
+  SELECT v.p1,
+         LEAST(v.max_depth, 9223372036854775807)::bigint AS depth,
+         ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = v.p1) AS fids
+  FROM (SELECT p1, max(p2::numeric + p3::numeric) AS max_depth FROM requests GROUP BY p1) v),
+ hub_floors AS MATERIALIZED (
+  SELECT h.fid,
+         (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id
+  FROM (
+   SELECT f.fid, max(dv.depth) AS depth
+   FROM distinct_viewers dv, unnest(dv.fids) AS f(fid)
+   GROUP BY f.fid HAVING count(*) >= 2
+   ORDER BY count(*) DESC, f.fid LIMIT 32
+  ) h),
+ cap_authors AS MATERIALIZED (
+  SELECT ARRAY(
+   SELECT hf.fid FROM (
+    SELECT hf.fid FROM hub_floors hf WHERE hf.floor_id IS NOT NULL ORDER BY hf.floor_id DESC LIMIT 16
+   ) hf
+   WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = hf.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999)
+  ) AS fids),
+ viewer_counts AS MATERIALIZED (
+  SELECT dv.p1, dv.fids,
+         CASE WHEN cardinality(dv.fids) = 0 THEN 0::bigint
+              WHEN dv.fids && (SELECT fids FROM cap_authors) THEN 1000::bigint
+              WHEN EXISTS (SELECT 1 FROM articles a WHERE a.author_id = ANY(dv.fids) OFFSET 999 LIMIT 1) THEN 1000::bigint
+              ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(dv.fids) LIMIT 1000) s)
+         END AS n
+  FROM distinct_viewers dv),
+ distinct_pages AS MATERIALIZED (
+  SELECT DISTINCT r.p1, r.p2, r.p3, vc.fids, vc.n
+  FROM requests r JOIN viewer_counts vc ON vc.p1 = r.p1),
+ counted_pages AS MATERIALIZED (
+  SELECT dp.p1, dp.p2, dp.p3, dp.n, p.id FROM distinct_pages dp
+  CROSS JOIN LATERAL (SELECT COALESCE(max(hf.floor_id), 0::bigint) AS floor_id FROM hub_floors hf WHERE hf.fid = ANY(dp.fids)) fl
+  LEFT JOIN LATERAL (
+   SELECT id FROM (
+    SELECT x.id FROM unnest(dp.fids) AS fid
+    CROSS JOIN LATERAL (
+     SELECT a2.id FROM articles a2
+     WHERE a2.author_id = fid AND a2.id >= fl.floor_id
+     ORDER BY a2.id DESC LIMIT (LEAST(dp.p2::numeric + dp.p3::numeric, 9223372036854775807)::bigint)
+    ) x
+    ORDER BY x.id DESC LIMIT 100 OFFSET dp.p3
+   ) b ORDER BY id DESC LIMIT dp.p2
+  ) p ON cardinality(dp.fids) > 0),
+ ` + sharedEnrichedTail + `
+ SELECT cp.n, e.id, e.slug, e.title, e.description, e.created_at, e.updated_at,
+        COALESCE(e.tags, ARRAY[]::text[]), COALESCE(e.fc, 0::bigint),
+        COALESCE(e.id = ANY(r.favs), false),
+        e.username, e.bio, e.image,
+        true AS following,
+        r.ord::bigint
+ FROM requests r
+ JOIN counted_pages cp ON cp.p1 = r.p1 AND cp.p2 = r.p2 AND cp.p3 = r.p3
+ LEFT JOIN enriched e ON e.id = cp.id
+ ORDER BY r.ord, e.id DESC`
+	return stmtDef{sql: sql, params: "III"}
+}
+
+func makeShareArticleBySlug() stmtDef {
+	sql := `WITH requests AS MATERIALIZED (
+  SELECT r.p1, r.p2, r.ord
+  FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS r(p1, p2, ord)),
+ distinct_slugs AS MATERIALIZED (
+  SELECT DISTINCT p2 FROM requests),
+ enriched AS MATERIALIZED (
+  SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.author_id,
+         ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+                FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tags,
+         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS fc,
+         u.username, u.bio, u.image
+  FROM distinct_slugs ds
+  JOIN articles a ON a.slug = ds.p2
+  JOIN users u ON u.id = a.author_id)
+ SELECT e.id, e.slug, e.title, e.description, e.body, e.created_at, e.updated_at,
+        e.tags, e.fc,
+        (r.p1 <> 0 AND EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = r.p1 AND f.article_id = e.id)) AS favorited,
+        e.username, e.bio, e.image,
+        (r.p1 <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.p1 AND fo.followee_id = e.author_id)) AS following,
+        r.ord::bigint
+ FROM requests r
+ JOIN enriched e ON e.slug = r.p2
+ ORDER BY r.ord`
+	return stmtDef{sql: sql, params: "Ia"}
+}
+
+func makeShareComments() stmtDef {
+	sql := `WITH requests AS MATERIALIZED (
+  SELECT r.p1, r.p2, r.ord,
+         CASE WHEN r.p1 = 0 THEN ARRAY[]::bigint[] ELSE ARRAY(SELECT vo.followee_id FROM follows vo WHERE vo.follower_id = r.p1) END AS fols
+  FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS r(p1, p2, ord)),
+ distinct_slugs AS MATERIALIZED (
+  SELECT DISTINCT p2 FROM requests),
+ slug_comments AS MATERIALIZED (
+  SELECT a.slug, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image
+  FROM distinct_slugs ds
+  JOIN articles a ON a.slug = ds.p2
+  LEFT JOIN LATERAL (
+   SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id
+   FROM comments c WHERE c.article_id = a.id
+   ORDER BY c.created_at DESC, c.id DESC LIMIT 100
+  ) c ON true
+  LEFT JOIN users u ON u.id = c.author_id)
+ SELECT sc.id, sc.body, sc.created_at, sc.updated_at, sc.username, sc.bio, sc.image,
+        COALESCE(sc.author_id = ANY(r.fols), false) AS following,
+        r.ord::bigint
+ FROM requests r
+ JOIN slug_comments sc ON sc.slug = r.p2
+ ORDER BY r.ord, sc.created_at DESC, sc.id DESC`
+	return stmtDef{sql: sql, params: "Ia"}
+}
+
 const slugify = `trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g')))`
 
 const (
@@ -291,23 +412,26 @@ var stmts = [numStmts]stmtDef{
 	stBatchArticleBySlug: makeBatchStmt(articleBySlug, "it", ""),
 	stBatchComments:      makeBatchStmt(sqlComments, "it", "q.created_at DESC, q.id DESC"),
 
-	// Shared-enrichment list statements.
+	// Shared-enrichment read statements.
 	stShareListAll: makeShareListAll(),
 	stShareListTag: makeShareListFiltered(
 		`SELECT t.id FROM tags t WHERE t.name = d.p4`,
-		`(SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = f.fid LIMIT 1000) s)`,
+		`(SELECT CASE WHEN EXISTS (SELECT 1 FROM article_tags at WHERE at.tag_id = f.fid OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = f.fid LIMIT 1000) s) END)`,
 		`SELECT id FROM (SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = dp.fid ORDER BY at.article_id DESC LIMIT 100 OFFSET dp.p3) b ORDER BY id DESC LIMIT dp.p2`,
 	),
 	stShareListAuthor: makeShareListFiltered(
 		`SELECT u.id FROM users u WHERE u.username = d.p4`,
-		`(SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = f.fid LIMIT 1000) s)`,
+		`(SELECT CASE WHEN EXISTS (SELECT 1 FROM articles a WHERE a.author_id = f.fid OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = f.fid LIMIT 1000) s) END)`,
 		`SELECT id FROM (SELECT a2.id FROM articles a2 WHERE a2.author_id = dp.fid ORDER BY a2.id DESC LIMIT 100 OFFSET dp.p3) b ORDER BY id DESC LIMIT dp.p2`,
 	),
 	stShareListFavorite: makeShareListFiltered(
 		`SELECT u.id FROM users u WHERE u.username = d.p4`,
-		`(SELECT count(*) FROM (SELECT 1 FROM favorites fv WHERE fv.user_id = f.fid LIMIT 1000) s)`,
+		`(SELECT CASE WHEN EXISTS (SELECT 1 FROM favorites fv WHERE fv.user_id = f.fid OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM favorites fv WHERE fv.user_id = f.fid LIMIT 1000) s) END)`,
 		`SELECT id FROM (SELECT fv.article_id AS id FROM favorites fv WHERE fv.user_id = dp.fid ORDER BY fv.article_id DESC LIMIT 100 OFFSET dp.p3) b ORDER BY id DESC LIMIT dp.p2`,
 	),
+	stShareListFeed:      makeShareListFeed(),
+	stShareArticleBySlug: makeShareArticleBySlug(),
+	stShareComments:      makeShareComments(),
 
 	// Write statements.
 	stRegister: {`INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)
@@ -377,9 +501,9 @@ func batchStmtFor(st stmtID) (stmtID, bool) {
 	return 0, false
 }
 
-// shareStmtFor maps a list read statement ID to its shared-enrichment counterpart.
+// shareStmtFor maps a read statement ID to its shared-enrichment counterpart.
 func shareStmtFor(st stmtID) (stmtID, bool) {
-	if st >= stListAll && st <= stListFavorite {
+	if st >= stListAll && st <= stComments {
 		return stShareListAll + (st - stListAll), true
 	}
 	return 0, false
