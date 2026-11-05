@@ -15,25 +15,26 @@ A Conduit server in pure Go (`CGO_ENABLED=0`) built on a custom multi-loop `epol
 
 ## Key Optimizations (`go-epoll-kaikegm`)
 
-1. **Family-Affinity Read Routing & Zero-Syscall EWMA Batch Governor (`src/db.go`, `src/api.go`):**
+1. **Same-CPU Go $\leftrightarrow$ PostgreSQL Adaptive Balancer & Family-Affinity Routing (`src/db.go`, `src/main.go`):**
    - Requests are classified into read families (`GET /api/tags`, `GET /api/articles` unfiltered/tag/author/favorited, `GET /api/articles/feed`, `GET /api/articles/:slug`, `GET /api/articles/:slug/comments`, `GET /api/profiles/:username`, `GET /api/user`) at HTTP frame time before leaving the reactor loop.
    - Each read connection worker owns an independent ring queue (`w.q`) and tracks in-queue counts per `readFamily`. Incoming read jobs route to a worker already accumulating the same family (within `readRouteSlack = 8`), maximizing batch homogeneity.
-   - Each read worker tracks an integer Exponentially Weighted Moving Average (`w.ewmaLen = (w.ewmaLen*7 + len(jobs)) >> 3`) of recent batch sizes and releases `collect()` early (`200 µs` max linger) as soon as the dynamic target is reached.
+   - **Adaptive Same-CPU Balancer:** Tracks active PostgreSQL read/write flights (`activeReads`, `activeWrites`) and per-worker execution latency EWMA (`w.ewmaUs`) alongside batch-size EWMA (`w.ewmaLen`). When PostgreSQL is loaded on the shared 8-vCPU host (`activeReads + activeWrites >= maxReadConc`), the balancer gates concurrent pipelined read batches and dynamically raises the coalescing target and linger window (up to `450 µs`), producing larger deduplicated CTE / `UNNEST` batches with fewer PostgreSQL executions.
+   - Each PostgreSQL session configures `work_mem = 32MB`, `random_page_cost = 1.1`, `cpu_index_tuple_cost = 0.0005`, and `effective_io_concurrency = 200` at startup.
 
-2. **Broadcast, Coalesced `LATERAL`, Shared Feed Hubs, and Shared-Enrichment `MATERIALIZED` CTE Queries (`src/sql.go`, `src/db.go`):**
+2. **Coalesced `UNNEST` Write Group-Commit & B-Tree Monotonic Key Sorting (`src/sql.go`, `src/db.go`):**
+   - **Batched Write Coalescing (`stBatchFollow`, `stBatchUnfollow`, `stBatchFavorite`, `stBatchUnfavorite`, `stBatchCommentCreate`):** Collapses multiple concurrent `POST/DELETE` follow, favorite, and comment-creation requests in a write commit batch into a single `UNNEST(...) WITH ORDINALITY` statement per write type, cutting PostgreSQL planner/executor overhead and index lock acquisitions while preserving exact per-request `404` / `200` / `201` semantics.
+   - **B-Tree Monotonic Batch Sorting (`sortGroupByKey`):** Sorts coalesced read and write groups in-place by their primary B-tree index key (`slug`, `username`, `tag`, `offset`) before binding `UNNEST` array parameters so PostgreSQL index probes walk B-tree leaf pages monotonically and avoid row-lock contention on concurrent writes.
+
+3. **Broadcast, Coalesced `LATERAL`, Shared Feed Hubs, and Shared-Enrichment `MATERIALIZED` CTE Queries (`src/sql.go`, `src/db.go`):**
    - **`groupBroadcast` (`GET /api/tags`):** Executes `stTags` once and broadcasts the serialized JSON response across all requests in the group.
-   - **`groupCoalesced` (`unnest(...) WITH ORDINALITY CROSS JOIN LATERAL`):** Collapses up to 32 concurrent single-row or feed/comment reads into a single PostgreSQL statement execution, demultiplexed by `ord` in `rowReader`.
+   - **`groupCoalesced` (`unnest(...) WITH ORDINALITY CROSS JOIN LATERAL`):** Collapses up to 64 concurrent single-row or feed/comment reads into a single PostgreSQL statement execution, demultiplexed by `ord` in `rowReader`.
    - **Shared-Enrichment Article List, Slug & Comment CTEs (`stShareListAll`, `stShareListTag`, `stShareListAuthor`, `stShareListFavorite`, `stShareArticleBySlug`, `stShareComments`):** Deduplicates `(filter, limit, offset)` pages and colliding `slug` lookups within the same batch, computes `OFFSET 999 LIMIT 1` short-circuit bounded counts once per distinct filter, aggregates tags once per distinct article ID (`article_tag_arrays`), and enriches author/favorite/following metadata once per distinct article in the batch.
    - **Shared Feed Hubs (`stShareListFeed`):** Identifies popular followees (`hub_floors`) shared by $\ge 2$ viewers in a batch, computes their $(limit+offset)$-th newest article ID as a scan floor (`a2.id >= fl.floor_id`) to prune B-tree index walks, and short-circuits `articlesCount = 1000` (`cap_authors`) whenever a viewer follows a hub author with $\ge 1,000$ articles.
 
-3. **Listener Socket Inheritance & Short-Circuit Count Subqueries (`src/reactor_linux.go`, `src/sql.go`, `src/main.go`):**
+4. **L1D Cache-Aligned 4-Lane `bcryptx`, Listener Socket Inheritance & Zero-Allocation Hot Path (`src/internal/bcryptx/bcryptx.go`, `src/reactor_linux.go`, `src/jwt.go`, `src/jsonw.go`):**
+   - **Cache-Set-Offset 4-Lane `bcryptx`:** Pads each Blowfish `state` struct from `4,168` bytes to `4,224` bytes (`66` cache lines) so all 4 interleaved lanes (`16.9 KB` total) fit inside a single core's L1D cache without 4 KB cache-set aliasing.
    - Sets `TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, and `TCP_KEEPCNT` once on each listener socket so accepted connections inherit them automatically inside the Linux kernel (eliminating 5 `setsockopt` syscalls per `accept4`), and automatically raises `RLIMIT_NOFILE` soft limit to the hard limit at startup.
-   - All `EXISTS (... WHERE follower_id = $1)` and `EXISTS (... WHERE user_id = $1)` subqueries guard on `$1::bigint <> 0`, eliminating B-tree index probes when `viewer == 0` (anonymous traffic).
-
-4. **Zero-Allocation Hot Path (`src/jwt.go`, `src/util.go`, `src/jsonw.go`):**
-   - JWT HS256 verification and signing use `zerojwt/v2` (`VerifyWithScratch` / `SignWithScratch`) with per-worker stack/struct scratch buffers.
-   - Write request bodies (`POST/PUT`) use `parseFastWrapper` to scan flat JSON payloads in-place without heap allocations.
-   - JSON string escaping processes 8 bytes per iteration using a 256-entry lookup table.
+   - JWT HS256 verification and signing use `zerojwt/v2` (`VerifyWithScratch` / `SignWithScratch`) with per-worker stack/struct scratch buffers; write request bodies (`POST/PUT`) use `parseFastWrapper` in-place; JSON string escaping processes 8 bytes per iteration.
 
 ## Build and run
 

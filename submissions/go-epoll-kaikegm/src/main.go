@@ -188,6 +188,10 @@ func postgresConfig(url string) (*pgconn.Config, error) {
 		"jit":                                 "off",    // short queries; JIT only adds latency
 		"max_parallel_workers_per_gather":     "0",      // concurrency comes from many requests
 		"enable_memoize":                      "off",    // avoid Memoize hash overhead on batched queries
+		"work_mem":                            "32MB",   // keep MATERIALIZED CTEs in RAM
+		"random_page_cost":                    "1.1",    // dataset fits in 16 GB RAM
+		"cpu_index_tuple_cost":                "0.0005", // prefer index scans
+		"effective_io_concurrency":            "200",
 	}
 	for k, v := range settings {
 		pg.RuntimeParams[k] = v

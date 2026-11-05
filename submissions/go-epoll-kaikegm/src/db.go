@@ -34,6 +34,7 @@ package main
 // new password's request comes back to the write queue once hashed.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -78,13 +79,13 @@ func dbConfigFromEnv(cores, slots int) (dbConfig, error) {
 		dst         *int
 		def, lo, hi int
 	}{
-		{"DB_READ_CONNS", &c.readConns, 12, 1, 95},
-		{"DB_WRITE_CONNS", &c.writeConns, 2, 1, 95},
-		{"READ_BATCH", &c.readBatch, 32, 1, 256},
-		{"WRITE_BATCH", &c.writeBatch, 128, 1, 1024},
+		{"DB_READ_CONNS", &c.readConns, min(12, max(6, cores)), 1, 95},
+		{"DB_WRITE_CONNS", &c.writeConns, min(4, max(2, cores/3)), 1, 95},
+		{"READ_BATCH", &c.readBatch, 64, 1, 256},
+		{"WRITE_BATCH", &c.writeBatch, 256, 1, 1024},
 		{"PIPELINE_DEPTH", &c.pipelineDepth, 2, 1, 16},
 		{"READ_ROUTE_SLACK", &c.readRouteSlack, 8, 0, 256},
-		{"BCRYPT_WORKERS", &c.bcryptWorkers, max(1, cores/4), 1, 128},
+		{"BCRYPT_WORKERS", &c.bcryptWorkers, max(2, cores/3), 1, 128},
 		{"BCRYPT_QUEUE", &c.bcryptQueue, slots, 1, 1 << 20},
 	}
 	for _, v := range ints {
@@ -105,8 +106,8 @@ func dbConfigFromEnv(cores, slots int) (dbConfig, error) {
 		{"WRITE_FLUSH_INTERVAL", &c.writeFlush, 200 * time.Millisecond},
 		{"QUEUE_TIMEOUT", &c.queueTimeout, 30 * time.Second},
 		{"DB_EXEC_TIMEOUT", &c.execTimeout, 10 * time.Second},
-		{"BCRYPT_WAIT", &c.bcryptWait, 150 * time.Millisecond},
-		{"BCRYPT_STRETCH", &c.bcryptStretch, 250 * time.Millisecond},
+		{"BCRYPT_WAIT", &c.bcryptWait, 25 * time.Millisecond},
+		{"BCRYPT_STRETCH", &c.bcryptStretch, 180 * time.Millisecond},
 		{"DB_RECONNECT_MIN", &c.reconnectMin, 100 * time.Millisecond},
 		{"DB_RECONNECT_MAX", &c.reconnectMax, 5 * time.Second},
 	}
@@ -140,6 +141,13 @@ type dbDispatcher struct {
 	bcryptReady chan *bcryptBatch // collector -> compute workers
 	bcryptFree  chan *bcryptBatch // reusable batches
 
+	// Adaptive Go <-> PostgreSQL Same-CPU Balancer state:
+	// Tracks active read & write flights in PostgreSQL so Go dynamically scales
+	// batch coalescing windows and limits concurrent heavy PG queries on the same 8-vCPU host.
+	activeReads  atomic.Int32
+	activeWrites atomic.Int32
+	maxReadConc  int32
+
 	workers []*worker
 	wg      sync.WaitGroup // database workers
 	bcWG    sync.WaitGroup // bcrypt goroutines
@@ -155,9 +163,10 @@ type worker struct {
 	pipe  *pgconn.Pipeline
 	sd    [numStmts]*pgconn.StatementDescription // prepared statements, by id
 
-	load     atomic.Int64                    // queued + in-flight requests on this read worker
-	families [numReadFamilies]atomic.Int64   // queued requests per read family on this read worker
-	ewmaLen  int                             // EWMA of recent read batch sizes (zero-syscall governor)
+	load     atomic.Int64                  // queued + in-flight requests on this read worker
+	families [numReadFamilies]atomic.Int64 // queued requests per read family on this read worker
+	ewmaLen  int                           // EWMA of recent read batch sizes (zero-syscall governor)
+	ewmaUs   int64                         // EWMA of recent PostgreSQL batch execution time in microseconds
 
 	jobs     []*reactorJob // the batch being collected (reused)
 	pending  []*reactorJob // the part of it that needs a statement (reused)
@@ -196,14 +205,16 @@ type flightGroup struct {
 type flight struct {
 	jobs   []*reactorJob
 	groups []flightGroup
+	sentAt int64
 	single bool
 }
 
 func newDBDispatcher(s *reactorServer, cfg dbConfig, pgcfg *pgconn.Config, secret []byte) *dbDispatcher {
 	d := &dbDispatcher{
 		s: s, cfg: cfg, pgcfg: pgcfg, secret: secret,
-		write:  make(chan *reactorJob, cfg.writeQueue),
-		bcrypt: make(chan *reactorJob, cfg.bcryptQueue),
+		write:       make(chan *reactorJob, cfg.writeQueue),
+		bcrypt:      make(chan *reactorJob, cfg.bcryptQueue),
+		maxReadConc: int32(max(3, cfg.readConns-1)),
 	}
 	for i := range cfg.readConns + cfg.writeConns {
 		w := &worker{d: d, write: i >= cfg.readConns, jwt: newJWTCodec(secret)}
@@ -214,10 +225,11 @@ func newDBDispatcher(s *reactorServer, cfg dbConfig, pgcfg *pgconn.Config, secre
 			w.q = d.write
 		} else {
 			w.q = make(chan *reactorJob, cfg.readQueue)
-			w.batchBuf = make([]byte, 0, 8192)
-			w.replies = make([]reply, limit)
 			w.ewmaLen = max(4, limit/4)
+			w.ewmaUs = 1500
 		}
+		w.batchBuf = make([]byte, 0, 8192)
+		w.replies = make([]reply, limit)
 		w.jobs = make([]*reactorJob, 0, limit)
 		w.pending = make([]*reactorJob, 0, limit)
 		w.ring = make([]flight, cfg.pipelineDepth)
@@ -407,8 +419,8 @@ func (d *dbDispatcher) after(j *reactorJob, act action) {
 
 // loop keeps up to PIPELINE_DEPTH batches in flight. It blocks for new work
 // only when nothing is in flight; for reads with a batch already in flight, it
-// waits to send a second pipelined batch unless a full batch has accumulated,
-// so requests coalesce into larger batches while PostgreSQL runs the first one.
+// waits to send a second pipelined batch unless a full batch has accumulated
+// AND the Adaptive Same-CPU Balancer shows PostgreSQL has spare CPU capacity.
 func (w *worker) loop(q chan *reactorJob) {
 	open := true
 	for {
@@ -424,8 +436,12 @@ func (w *worker) loop(q chan *reactorJob) {
 			if !open {
 				break
 			}
-			if !w.write && w.n > 0 && len(q) < max(8, w.ewmaLen) {
-				break
+			if !w.write && w.n > 0 {
+				// Adaptive Same-CPU Balancer: only pipeline a second concurrent read batch
+				// when PostgreSQL active flights are below maxReadConc and a full batch is waiting.
+				if w.d.activeReads.Load()+w.d.activeWrites.Load() >= w.d.maxReadConc || len(q) < max(8, w.ewmaLen) {
+					break
+				}
 			}
 			jobs, ok := w.next(q, w.n == 0)
 			if !ok {
@@ -482,8 +498,10 @@ func (w *worker) next(q chan *reactorJob, block bool) ([]*reactorJob, bool) {
 }
 
 // collect drains already-queued requests into the batch. With nothing in
-// flight (linger), a batch waits up to WRITE_LINGER / READ_LINGER for more requests,
-// releasing early for reads once the EWMA target batch size is reached.
+// flight (linger), the Adaptive Go <-> PostgreSQL Same-CPU Balancer scales
+// the coalescing window from w.d.activeReads, w.d.activeWrites, and w.ewmaUs
+// so when PostgreSQL is heavily loaded on the shared 8-core host, Go raises
+// the batch target and coalesces slightly longer without stalling idle queues.
 func (w *worker) collect(q chan *reactorJob, jobs []*reactorJob, linger bool) []*reactorJob {
 	limit := cap(jobs)
 	perWait := w.d.cfg.writeLinger
@@ -491,8 +509,19 @@ func (w *worker) collect(q chan *reactorJob, jobs []*reactorJob, linger bool) []
 	target := limit
 	if !w.write {
 		perWait = w.d.cfg.readLinger
-		totalWait = w.d.cfg.readLinger
-		target = min(limit, max(4, w.ewmaLen+(w.ewmaLen>>2)))
+		active := w.d.activeReads.Load() + w.d.activeWrites.Load()
+		// Adaptive Same-CPU Balancer: scale target batch size and gently stretch
+		// linger (up to 450µs) when Postgres is busy on the shared 8-vCPU host.
+		if active >= w.d.maxReadConc && w.ewmaUs > 2500 {
+			adaptiveWait := min(450*time.Microsecond, time.Duration(w.ewmaUs/10)*time.Microsecond)
+			if adaptiveWait > perWait {
+				perWait = adaptiveWait
+			}
+			target = min(limit, max(8, w.ewmaLen+(w.ewmaLen>>1)))
+		} else {
+			target = min(limit, max(4, w.ewmaLen+(w.ewmaLen>>2)))
+		}
+		totalWait = perWait
 	}
 	for len(jobs) < limit {
 		select {
@@ -639,6 +668,59 @@ func samePageKey(a, b *dbJob) bool {
 	return true
 }
 
+func readPrimarySortCol(stmt stmtID) int {
+	switch stmt {
+	case stProfile, stArticleBySlug, stComments:
+		return 1
+	case stListAll:
+		return 2
+	case stListTag, stListAuthor, stListFavorite:
+		return 3
+	default:
+		return 0
+	}
+}
+
+// sortGroupByKey orders a coalesced group by its primary index column in-place
+// so PostgreSQL B-tree index probes walk leaf pages monotonically.
+func sortGroupByKey(group []*reactorJob, col int) {
+	for i := 1; i < len(group); i++ {
+		item := group[i]
+		key := item.db.params[col]
+		key0 := item.db.params[0]
+		pos := i - 1
+		for pos >= 0 {
+			cmp := bytes.Compare(key, group[pos].db.params[col])
+			if cmp > 0 || (cmp == 0 && (col == 0 || bytes.Compare(key0, group[pos].db.params[0]) >= 0)) {
+				break
+			}
+			group[pos+1] = group[pos]
+			pos--
+		}
+		group[pos+1] = item
+	}
+}
+
+func (w *worker) sendCoalescedStmt(targetStmt stmtID, spec string, group []*reactorJob) {
+	nparams := len(spec)
+	w.batchBuf = w.batchBuf[:0]
+	var offs [4][2]int
+	for col := 0; col < nparams; col++ {
+		startOff := len(w.batchBuf)
+		if spec[col] == 'i' {
+			w.batchBuf = appendInt8ArrayParam(w.batchBuf, group, col)
+		} else {
+			w.batchBuf = appendBatchTextArrayParam(w.batchBuf, group, col)
+		}
+		offs[col] = [2]int{startOff, len(w.batchBuf)}
+	}
+	var params [4][]byte
+	for col := 0; col < nparams; col++ {
+		params[col] = w.batchBuf[offs[col][0]:offs[col][1]]
+	}
+	w.pipe.SendQueryStatement(w.sd[targetStmt], params[:nparams], paramBinary, resultBinary)
+}
+
 func (w *worker) sendReadGroup(f *flight, stmt stmtID, start, end int) {
 	group := f.jobs[start:end]
 	if len(group) == 1 {
@@ -659,33 +741,41 @@ func (w *worker) sendReadGroup(f *flight, stmt stmtID, start, end int) {
 		}
 		return
 	}
+	sortGroupByKey(group, readPrimarySortCol(stmt))
 	if shareStmt, canShare := shareStmtFor(stmt); canShare && shouldShare(stmt, group) {
 		targetStmt = shareStmt
 	}
 	f.groups = append(f.groups, flightGroup{mode: groupCoalesced, start: start, end: end})
-	nparams := group[0].db.nparams
-	spec := stmts[stmt].params
-	w.batchBuf = w.batchBuf[:0]
-	var offs [4][2]int
-	for col := 0; col < nparams; col++ {
-		startOff := len(w.batchBuf)
-		if spec[col] == 'i' {
-			w.batchBuf = appendInt8ArrayParam(w.batchBuf, group, col)
-		} else {
-			w.batchBuf = appendBatchTextArrayParam(w.batchBuf, group, col)
-		}
-		offs[col] = [2]int{startOff, len(w.batchBuf)}
-	}
-	var params [4][]byte
-	for col := 0; col < nparams; col++ {
-		params[col] = w.batchBuf[offs[col][0]:offs[col][1]]
-	}
-	w.pipe.SendQueryStatement(w.sd[targetStmt], params[:nparams], paramBinary, resultBinary)
+	w.sendCoalescedStmt(targetStmt, stmts[stmt].params, group)
 }
 
-// send queues one batch on the pipeline: for writes (or single retries), one
-// prepared statement per request; for reads, compatible statements in the batch
-// are coalesced into one statement per statement family, followed by a single Sync.
+func (w *worker) sendWriteGroup(f *flight, stmt stmtID, start, end int) {
+	group := f.jobs[start:end]
+	if len(group) == 1 {
+		f.groups = append(f.groups, flightGroup{mode: groupSingle, start: start, end: end})
+		w.sendSingleStmt(group[0])
+		return
+	}
+	targetStmt, spec, ok := writeBatchStmtFor(stmt)
+	if !ok {
+		for i := start; i < end; i++ {
+			f.groups = append(f.groups, flightGroup{mode: groupSingle, start: i, end: i + 1})
+			w.sendSingleStmt(f.jobs[i])
+		}
+		return
+	}
+	sortCol := 0
+	if stmt >= stFollow && stmt <= stUnfavorite {
+		sortCol = 1
+	}
+	sortGroupByKey(group, sortCol)
+	f.groups = append(f.groups, flightGroup{mode: groupCoalesced, start: start, end: end})
+	w.sendCoalescedStmt(targetStmt, spec, group)
+}
+
+// send queues one batch on the pipeline: compatible read or write statements
+// in the batch are coalesced into one UNNEST statement per statement family,
+// followed by a single Sync.
 func (w *worker) send(jobs []*reactorJob, single bool) {
 	if jobs = w.reconnect(jobs); len(jobs) == 0 {
 		return
@@ -693,15 +783,16 @@ func (w *worker) send(jobs []*reactorJob, single bool) {
 	f := &w.ring[(w.head+w.n)%len(w.ring)]
 	f.jobs = f.jobs[:0]
 	f.groups = f.groups[:0]
+	f.sentAt = monoNow()
 	f.single = single
-	if w.write || single || len(jobs) == 1 {
+	if single || len(jobs) == 1 {
 		f.jobs = append(f.jobs, jobs...)
 		for i, j := range f.jobs {
 			f.groups = append(f.groups, flightGroup{mode: groupSingle, start: i, end: i + 1})
 			w.sendSingleStmt(j)
 		}
 	} else {
-		var used [256]bool
+		var used [1024]bool
 		for i, j := range jobs {
 			if used[i] {
 				continue
@@ -716,12 +807,21 @@ func (w *worker) send(jobs []*reactorJob, single bool) {
 				}
 			}
 			end := len(f.jobs)
-			w.sendReadGroup(f, stmt, start, end)
+			if w.write {
+				w.sendWriteGroup(f, stmt, start, end)
+			} else {
+				w.sendReadGroup(f, stmt, start, end)
+			}
 		}
 	}
 	w.pipe.SendPipelineSync()
 	_ = w.pg.Conn().SetDeadline(time.Now().Add(w.d.cfg.execTimeout))
 	w.n++
+	if w.write {
+		w.d.activeWrites.Add(1)
+	} else {
+		w.d.activeReads.Add(1)
+	}
 	if err := w.pipe.Flush(); err != nil {
 		if w.n > 1 {
 			// Older batches were already sent and may have run: drop the
@@ -736,6 +836,7 @@ func (w *worker) send(jobs []*reactorJob, single bool) {
 func (w *worker) receive() {
 	f := &w.ring[w.head]
 	jobs := f.jobs
+	sentAt := f.sentAt
 	done, failed, synced := w.readResults(f)
 	if !synced {
 		if lost := w.drainToSync(&failed); lost != nil {
@@ -747,6 +848,10 @@ func (w *worker) receive() {
 		// Lost results, or the server ended the session: the connection is unusable.
 		w.broken(failed, done)
 		return
+	}
+	if !w.write && sentAt > 0 {
+		elapsedUs := max(50, (monoNow()-sentAt)/1000)
+		w.ewmaUs = (w.ewmaUs*7 + elapsedUs) >> 3
 	}
 	w.pop()
 
@@ -841,7 +946,9 @@ func (w *worker) readResults(f *flight) (done int, failed error, synced bool) {
 			}
 			for _, j := range group {
 				done++
-				w.d.after(j, j.db.next)
+				if !w.write {
+					w.d.after(j, j.db.next)
+				}
 			}
 		case groupCoalesced:
 			if err := w.finishCoalesced(group, rawRR); err != nil {
@@ -849,7 +956,9 @@ func (w *worker) readResults(f *flight) (done int, failed error, synced bool) {
 			}
 			for _, j := range group {
 				done++
-				w.d.after(j, j.db.next)
+				if !w.write {
+					w.d.after(j, j.db.next)
+				}
 			}
 		}
 	}
@@ -891,6 +1000,11 @@ func (w *worker) drainToSync(failed *error) error {
 func (w *worker) pop() {
 	w.head = (w.head + 1) % len(w.ring)
 	w.n--
+	if w.write {
+		w.d.activeWrites.Add(-1)
+	} else {
+		w.d.activeReads.Add(-1)
+	}
 }
 
 // broken settles every batch in flight after the connection is lost. headDone

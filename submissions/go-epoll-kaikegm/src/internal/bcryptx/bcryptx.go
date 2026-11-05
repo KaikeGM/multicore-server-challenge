@@ -24,6 +24,7 @@ const (
 type state struct {
 	p              [18]uint32
 	s0, s1, s2, s3 [256]uint32
+	_              [14]uint32 // pad state from 4,168 to 4,224 bytes (66 cache lines) to avoid 4 KB L1D cache aliasing across 4 lanes
 }
 
 // pairs views P followed by the four S-boxes as the 521 (l, r) slots that key

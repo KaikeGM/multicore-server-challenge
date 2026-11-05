@@ -112,6 +112,13 @@ const (
 	stUnfavorite
 	stCommentCreate
 	stCommentDelete
+
+	// Coalesced batch write statements (unnest WITH ORDINALITY inside implicit pipeline transaction).
+	stBatchFollow
+	stBatchUnfollow
+	stBatchFavorite
+	stBatchUnfavorite
+	stBatchCommentCreate
 	numStmts
 
 	firstWriteStmt = stRegister
@@ -491,6 +498,110 @@ SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image
                 WHERE c.id = $1 AND a.slug = $2),
  w AS (DELETE FROM comments WHERE id = (SELECT id FROM t WHERE author_id = $3))
 SELECT author_id FROM t`, "iti"},
+
+	// Coalesced batch write statements.
+	stBatchFollow: {`WITH req AS MATERIALIZED (
+  SELECT r.p1, r.p2, r.ord
+  FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS r(p1, p2, ord)),
+ target AS MATERIALIZED (
+  SELECT u.id, u.username, u.bio, u.image
+  FROM (SELECT DISTINCT p2 FROM req) d
+  JOIN users u ON u.username = d.p2),
+ ins AS (
+  INSERT INTO follows (follower_id, followee_id)
+  SELECT DISTINCT r.p1, t.id
+  FROM req r JOIN target t ON t.username = r.p2
+  ORDER BY 1, 2
+  ON CONFLICT DO NOTHING)
+SELECT t.username, t.bio, t.image, r.ord::bigint
+FROM req r JOIN target t ON t.username = r.p2
+ORDER BY r.ord`, "Ia"},
+	stBatchUnfollow: {`WITH req AS MATERIALIZED (
+  SELECT r.p1, r.p2, r.ord
+  FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS r(p1, p2, ord)),
+ target AS MATERIALIZED (
+  SELECT u.id, u.username, u.bio, u.image
+  FROM (SELECT DISTINCT p2 FROM req) d
+  JOIN users u ON u.username = d.p2),
+ del AS (
+  DELETE FROM follows fo
+  USING req r, target t
+  WHERE r.p2 = t.username AND fo.follower_id = r.p1 AND fo.followee_id = t.id)
+SELECT t.username, t.bio, t.image, r.ord::bigint
+FROM req r JOIN target t ON t.username = r.p2
+ORDER BY r.ord`, "Ia"},
+	stBatchFavorite: {`WITH req AS MATERIALIZED (
+  SELECT r.p1, r.p2, r.ord
+  FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS r(p1, p2, ord)),
+ arts AS MATERIALIZED (
+  SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.author_id,
+         ARRAY(SELECT (SELECT tg.name FROM tags tg WHERE tg.id = at.tag_id) AS name
+                FROM article_tags at WHERE at.article_id = a.id ORDER BY name) AS tags,
+         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS base_favs,
+         u.username, u.bio, u.image
+  FROM (SELECT DISTINCT p2 FROM req) s
+  JOIN articles a ON a.slug = s.p2
+  JOIN users u ON u.id = a.author_id),
+ ins AS MATERIALIZED (
+  INSERT INTO favorites (user_id, article_id)
+  SELECT DISTINCT r.p1, a.id
+  FROM req r JOIN arts a ON a.slug = r.p2
+  ORDER BY 1, 2
+  ON CONFLICT DO NOTHING
+  RETURNING article_id),
+ delta AS MATERIALIZED (
+  SELECT article_id, count(*) AS added FROM ins GROUP BY article_id)
+SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,
+       a.tags, a.base_favs + COALESCE(d.added, 0)::bigint, true,
+       a.username, a.bio, a.image,
+       (r.p1 <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.p1 AND fo.followee_id = a.author_id)),
+       r.ord::bigint
+FROM req r
+JOIN arts a ON a.slug = r.p2
+LEFT JOIN delta d ON d.article_id = a.id
+ORDER BY r.ord`, "Ia"},
+	stBatchUnfavorite: {`WITH req AS MATERIALIZED (
+  SELECT r.p1, r.p2, r.ord
+  FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS r(p1, p2, ord)),
+ arts AS MATERIALIZED (
+  SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.author_id,
+         ARRAY(SELECT (SELECT tg.name FROM tags tg WHERE tg.id = at.tag_id) AS name
+                FROM article_tags at WHERE at.article_id = a.id ORDER BY name) AS tags,
+         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS base_favs,
+         u.username, u.bio, u.image
+  FROM (SELECT DISTINCT p2 FROM req) s
+  JOIN articles a ON a.slug = s.p2
+  JOIN users u ON u.id = a.author_id),
+ del AS MATERIALIZED (
+  DELETE FROM favorites f
+  USING req r, arts a
+  WHERE r.p2 = a.slug AND f.user_id = r.p1 AND f.article_id = a.id
+  RETURNING f.article_id),
+ delta AS MATERIALIZED (
+  SELECT article_id, count(*) AS removed FROM del GROUP BY article_id)
+SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,
+       a.tags, GREATEST(a.base_favs - COALESCE(d.removed, 0)::bigint, 0::bigint), false,
+       a.username, a.bio, a.image,
+       (r.p1 <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.p1 AND fo.followee_id = a.author_id)),
+       r.ord::bigint
+FROM req r
+JOIN arts a ON a.slug = r.p2
+LEFT JOIN delta d ON d.article_id = a.id
+ORDER BY r.ord`, "Ia"},
+	stBatchCommentCreate: {`WITH req AS MATERIALIZED (
+  SELECT r.p2, r.p3, r.ord, a.id AS article_id, nextval('comments_id_seq') AS comment_id
+  FROM unnest($1::text[], $2::bigint[], $3::text[]) WITH ORDINALITY AS r(p1, p2, p3, ord)
+  JOIN articles a ON a.slug = r.p1),
+ ins AS MATERIALIZED (
+  INSERT INTO comments (id, article_id, author_id, body)
+  SELECT comment_id, article_id, p2, p3 FROM req
+  RETURNING id, body, created_at, updated_at, author_id)
+SELECT ins.id, ins.body, ins.created_at, ins.updated_at,
+       u.username, u.bio, u.image, r.ord::bigint
+FROM ins
+JOIN req r ON r.comment_id = ins.id
+JOIN users u ON u.id = ins.author_id
+ORDER BY r.ord`, "aIa"},
 }
 
 // batchStmtFor maps a single-request read statement ID to its batched counterpart.
@@ -507,4 +618,22 @@ func shareStmtFor(st stmtID) (stmtID, bool) {
 		return stShareListAll + (st - stListAll), true
 	}
 	return 0, false
+}
+
+// writeBatchStmtFor maps a single-request write statement ID to its batched counterpart.
+func writeBatchStmtFor(st stmtID) (stmtID, string, bool) {
+	switch st {
+	case stFollow:
+		return stBatchFollow, "it", true
+	case stUnfollow:
+		return stBatchUnfollow, "it", true
+	case stFavorite:
+		return stBatchFavorite, "it", true
+	case stUnfavorite:
+		return stBatchUnfavorite, "it", true
+	case stCommentCreate:
+		return stBatchCommentCreate, "tit", true
+	default:
+		return 0, "", false
+	}
 }
